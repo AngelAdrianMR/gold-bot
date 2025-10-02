@@ -1,6 +1,5 @@
 import yfinance as yf
 import pandas as pd
-import requests
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, MACD
 from ta.volatility import BollingerBands, AverageTrueRange
@@ -11,7 +10,6 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # -------------------
 TOKEN = "8172753785:AAF0pHsdL_9G3P6oR5MaY4799s_TjmR_eJQ"
 CHAT_ID = "7590209265"
-NEWS_API_KEY = "2ee036f076604dd2b0da40502dec0001"
 
 # Activo Yahoo Finance (futuros oro COMEX en USD)
 activo_yahoo = "GC=F"
@@ -28,7 +26,6 @@ ajuste_cfd_manual = None   # se podrá definir con /set_cfd
 # FUNCIONES DE PRECIOS
 # -------------------
 def obtener_precio_actual():
-    """Obtiene el último precio de GC=F (futuros COMEX)"""
     try:
         df = yf.download(activo_yahoo, period="1d", interval="1m", auto_adjust=True)
         if not df.empty:
@@ -39,7 +36,6 @@ def obtener_precio_actual():
 
 
 def calcular_ajuste_cfd():
-    """Calcula diferencia aproximada entre futuros y CFD"""
     global ajuste_cfd_manual
     if ajuste_cfd_manual is not None:
         return ajuste_cfd_manual
@@ -57,7 +53,6 @@ def calcular_ajuste_cfd():
 
 
 def ajustar_a_cfd(precio):
-    """Aplica ajuste dinámico a CFD eToro"""
     ajuste = calcular_ajuste_cfd()
     if precio:
         return precio + ajuste
@@ -95,24 +90,6 @@ def obtener_multiframe():
 
 
 # -------------------
-# NOTICIAS
-# -------------------
-def obtener_noticias():
-    url = f"https://newsapi.org/v2/everything?q=gold+OR+XAU+OR+inflation+OR+Fed+OR+ECB+OR+central+bank&language=en&sortBy=publishedAt&apiKey={NEWS_API_KEY}"
-    try:
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        noticias = []
-        if "articles" in data:
-            for art in data["articles"][:3]:
-                noticias.append(f"📰 {art['title']} ({art['source']['name']})\n{art['url']}")
-        return noticias
-    except Exception as e:
-        print("Error NewsAPI:", e)
-        return []
-
-
-# -------------------
 # ANÁLISIS DE OPORTUNIDAD
 # -------------------
 def analizar_oportunidad(frames):
@@ -146,18 +123,15 @@ def analizar_oportunidad(frames):
 
 
 # -------------------
-# GENERADOR DE RECOMENDACIONES (con SL/TP dinámicos)
+# GENERADOR DE RECOMENDACIONES
 # -------------------
 def generar_recomendacion(signal, spot):
     if not spot:
         return "⚠️ No se pudo calcular recomendación (sin precio actual)"
 
     spot_cfd = ajustar_a_cfd(spot)
-
-    # Descargar velas para ATR, soportes y resistencias
     df = yf.download(activo_yahoo, period="5d", interval="15m", auto_adjust=True).dropna()
 
-    # 🔧 Aplanamos arrays a 1D
     high = pd.Series(df["High"].values.ravel(), index=df.index)
     low = pd.Series(df["Low"].values.ravel(), index=df.index)
     close = pd.Series(df["Close"].values.ravel(), index=df.index)
@@ -168,14 +142,14 @@ def generar_recomendacion(signal, spot):
 
     if "COMPRA" in signal[0]:
         entrada = spot_cfd
-        sl = max(entrada - atr, soporte)              # SL dinámico
-        tp = min(entrada + 2*atr, resistencia)        # TP dinámico
+        sl = max(entrada - atr, soporte)
+        tp = min(entrada + 2*atr, resistencia)
         return f"📈 Recomendación CFD (eToro): ABRIR COMPRA\n🎯 Entrada: {entrada:.2f}\n🛑 Stop Loss: {sl:.2f}\n✅ Take Profit: {tp:.2f} (ATR={atr:.2f})"
 
     elif "VENTA" in signal[0]:
         entrada = spot_cfd
-        sl = min(entrada + atr, resistencia)          # SL dinámico
-        tp = max(entrada - 2*atr, soporte)            # TP dinámico
+        sl = min(entrada + atr, resistencia)
+        tp = max(entrada - 2*atr, soporte)
         return f"📉 Recomendación CFD (eToro): ABRIR VENTA\n🎯 Entrada: {entrada:.2f}\n🛑 Stop Loss: {sl:.2f}\n✅ Take Profit: {tp:.2f} (ATR={atr:.2f})"
 
     else:
@@ -183,7 +157,7 @@ def generar_recomendacion(signal, spot):
 
 
 # -------------------
-# SOPORTES Y RESISTENCIAS
+# SOPORTES / RESISTENCIAS
 # -------------------
 def calcular_sr():
     df = yf.download(activo_yahoo, period="3d", interval="15m", auto_adjust=True)
@@ -207,9 +181,9 @@ def evaluar_sr(spot, soporte, resistencia):
     if abs(spot_cfd - resistencia) <= margen:
         mensajes.append(f"🔴 Precio cerca de la RESISTENCIA clave: {resistencia:.2f}")
     if spot_cfd < soporte:
-        mensajes.append(f"❌ RUPTURA de SOPORTE → posible entrada en VENTA (CFD={spot_cfd:.2f})")
+        mensajes.append(f"❌ RUPTURA de SOPORTE → posible VENTA (CFD={spot_cfd:.2f})")
     if spot_cfd > resistencia:
-        mensajes.append(f"🚀 RUPTURA de RESISTENCIA → posible entrada en COMPRA (CFD={spot_cfd:.2f})")
+        mensajes.append(f"🚀 RUPTURA de RESISTENCIA → posible COMPRA (CFD={spot_cfd:.2f})")
 
     return "\n".join(mensajes) if mensajes else "📊 Precio dentro de rango normal"
 
@@ -268,7 +242,6 @@ async def revisar_mercado(context: ContextTypes.DEFAULT_TYPE):
         mensajes.append(evaluar_sr(spot, soporte, resistencia))
 
     mensajes.append(calcular_volatilidad())
-    mensajes.extend(obtener_noticias())
 
     for msg in mensajes:
         await context.bot.send_message(chat_id=CHAT_ID, text=msg)
@@ -306,7 +279,6 @@ async def set_rsi(update, context):
 
 
 async def set_cfd(update, context):
-    """Permite introducir el precio real de CFD en eToro"""
     global ajuste_cfd_manual
     try:
         precio_cfd = float(context.args[0])
@@ -314,10 +286,10 @@ async def set_cfd(update, context):
         if spot:
             ajuste_cfd_manual = precio_cfd - spot
             await update.message.reply_text(
-                f"✅ CFD ajustado. Precio actual GC=F: {spot:.2f}, CFD: {precio_cfd:.2f}, Diferencia: {ajuste_cfd_manual:.2f}"
+                f"✅ CFD ajustado. Precio GC=F: {spot:.2f}, CFD: {precio_cfd:.2f}, Dif: {ajuste_cfd_manual:.2f}"
             )
         else:
-            await update.message.reply_text("⚠️ No se pudo obtener GC=F para calcular ajuste")
+            await update.message.reply_text("⚠️ No se pudo obtener GC=F")
     except:
         await update.message.reply_text("⚠️ Usa: /set_cfd 3880")
 
