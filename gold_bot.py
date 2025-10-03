@@ -16,6 +16,7 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN", "PON_AQUI_TU_TOKEN")
 CHAT_IDS = ["7590209265", "8329147064"]
 
 activo_futuros = "GC=F"
+# Parámetros configurables
 config = {
     "rsi_high": 70,
     "rsi_low": 30,
@@ -23,29 +24,44 @@ config = {
     "ajuste_cfd_manual": None
 }
 
+# Última oportunidad detectada
 ultima_oportunidad = {"direccion": None, "precio": None, "hora": datetime.min}
 
 # -------------------
 # FUNCIONES DE PRECIOS
 # -------------------
 def obtener_precio_cfd():
-    """Precio CFD: GC=F + ajuste manual o -23 USD por defecto."""
+    """ Calcula el precio CFD del oro """
     try:
         fut = yf.download("GC=F", period="1d", interval="1m", auto_adjust=True)
         if fut.empty:
             return None
-        precio_fut = fut["Close"].iloc[-1]
+        precio_fut = fut["Close"].iloc[-1].item()  # ✅ evita FutureWarning
 
+        # Ajuste manual
         if config["ajuste_cfd_manual"] is not None:
             return float(precio_fut + config["ajuste_cfd_manual"])
 
+        # Intentar proxies
+        for proxy in ["XAU=X", "GLD"]:
+            try:
+                spot = yf.download(proxy, period="1d", interval="1m", auto_adjust=True)
+                if not spot.empty:
+                    precio_spot = spot["Close"].iloc[-1].item()
+                    ajuste = precio_spot - precio_fut
+                    return float(precio_fut + ajuste)
+            except Exception:
+                continue
+
+        # Fallback
         return float(precio_fut - 23)
+
     except Exception as e:
         print("Error obteniendo precio CFD:", e)
         return None
 
 # -------------------
-# INDICADORES
+# INDICADORES TÉCNICOS
 # -------------------
 def calcular_indicadores(df):
     if df.empty:
@@ -61,6 +77,7 @@ def calcular_indicadores(df):
     df["Boll_Upper"] = boll.bollinger_hband()
     df["Boll_Lower"] = boll.bollinger_lband()
     return df
+
 
 def obtener_multiframe():
     frames = {
@@ -105,31 +122,40 @@ def analizar_oportunidad(frames):
     else:
         return ["🤔 Mercado indeciso"] + señales
 
+
 def generar_recomendacion(signal, spot):
     if not spot:
         return "⚠️ Sin precio actual"
 
-    df = yf.download(activo_futuros, period="5d", interval="15m", auto_adjust=True).dropna()
-    if df.empty or len(df) < 15:
-        return "⚠️ No hay suficientes datos para ATR"
+    try:
+        df = yf.download(activo_futuros, period="5d", interval="15m", auto_adjust=True).dropna()
+        if df.empty or len(df) < 20:  # ✅ evita error cuando no hay suficientes velas
+            return "⚠️ No hay suficientes datos para ATR"
 
-    high, low, close = df["High"], df["Low"], df["Close"]
-    atr = AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1]
-    soporte = low.min(skipna=True)
-    resistencia = high.max(skipna=True)
+        high, low, close = df["High"], df["Low"], df["Close"]
 
-    if "COMPRA" in signal[0]:
-        entrada = spot
-        sl = max(entrada - atr, soporte)
-        tp = min(entrada + 2*atr, resistencia)
-        return f"📈 CFD COMPRA\nEntrada: {entrada:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f} (ATR={atr:.2f})"
-    elif "VENTA" in signal[0]:
-        entrada = spot
-        sl = min(entrada + atr, resistencia)
-        tp = max(entrada - 2*atr, soporte)
-        return f"📉 CFD VENTA\nEntrada: {entrada:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f} (ATR={atr:.2f})"
-    else:
-        return "🤔 Mercado sin dirección clara."
+        atr_series = AverageTrueRange(high, low, close, window=14).average_true_range()
+        if atr_series.empty:
+            return "⚠️ ATR no disponible"
+
+        atr = atr_series.iloc[-1]
+        soporte = low.min(skipna=True)
+        resistencia = high.max(skipna=True)
+
+        if "COMPRA" in signal[0]:
+            entrada = spot
+            sl = max(entrada - atr, soporte)
+            tp = min(entrada + 2*atr, resistencia)
+            return f"📈 CFD COMPRA\nEntrada: {entrada:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f} (ATR={atr:.2f})"
+        elif "VENTA" in signal[0]:
+            entrada = spot
+            sl = min(entrada + atr, resistencia)
+            tp = max(entrada - 2*atr, soporte)
+            return f"📉 CFD VENTA\nEntrada: {entrada:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f} (ATR={atr:.2f})"
+        else:
+            return "🤔 Mercado sin dirección clara."
+    except Exception as e:
+        return f"⚠️ Error en recomendación: {e}"
 
 # -------------------
 # MENSAJE UNIFICADO
@@ -151,11 +177,12 @@ def construir_mensaje():
 # TAREAS PROGRAMADAS
 # -------------------
 async def revisar_mercado(context: ContextTypes.DEFAULT_TYPE):
-    if datetime.now(timezone.utc).weekday() >= 5:  # fin de semana
+    if datetime.now(timezone.utc).weekday() >= 5:  # Sábado o domingo
         return
     msg = construir_mensaje()
     for chat_id in CHAT_IDS:
         await context.bot.send_message(chat_id=chat_id, text=msg)
+
 
 async def revisar_oportunidad(context: ContextTypes.DEFAULT_TYPE):
     global ultima_oportunidad
@@ -207,9 +234,14 @@ async def start(update, context):
     )
     await update.message.reply_text(help_text)
 
-help_cmd = start
-async def price(update, context): await update.message.reply_text(construir_mensaje())
-async def opportunity(update, context): await update.message.reply_text("📊 Oportunidad actual:\n" + construir_mensaje())
+help_cmd = start  # alias
+
+async def price(update, context): 
+    await update.message.reply_text(construir_mensaje())
+
+async def opportunity(update, context): 
+    await update.message.reply_text("📊 Oportunidad actual:\n" + construir_mensaje())
+
 async def addid(update, context):
     if context.args:
         new_id = context.args[0]
@@ -220,9 +252,11 @@ async def addid(update, context):
             await update.message.reply_text("⚠️ Ese chat_id ya está autorizado.")
     else:
         await update.message.reply_text("Uso: /addid <id>")
+
 async def show_config(update, context):
     msg = "⚙️ Configuración actual:\n" + "\n".join(f"{k}: {v}" for k, v in config.items())
     await update.message.reply_text(msg)
+
 async def set_config(update, context):
     if len(context.args) < 2:
         await update.message.reply_text("Uso: /s <param> <valor>")
@@ -242,10 +276,12 @@ async def set_config(update, context):
 # -------------------
 def main():
     application = Application.builder().token(TOKEN).build()
+    # Handlers cortos
     application.add_handler(CommandHandler("p", price))
     application.add_handler(CommandHandler("o", opportunity))
     application.add_handler(CommandHandler("c", show_config))
     application.add_handler(CommandHandler("s", set_config))
+    # Handlers largos
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("price", price))
@@ -253,6 +289,7 @@ def main():
     application.add_handler(CommandHandler("addid", addid))
     application.add_handler(CommandHandler("config", show_config))
     application.add_handler(CommandHandler("set", set_config))
+    # Jobs
     job_queue = application.job_queue
     job_queue.run_repeating(revisar_mercado, interval=1800, first=10)
     job_queue.run_repeating(revisar_oportunidad, interval=300, first=60)
@@ -264,9 +301,11 @@ def main():
 app = Flask(__name__)
 
 @app.route('/')
-def home(): return "Bot is running!"
+def home(): 
+    return "Bot is running!"
 
-def run_flask(): app.run(host="0.0.0.0", port=10000)
+def run_flask(): 
+    app.run(host="0.0.0.0", port=10000)
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask).start()
