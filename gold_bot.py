@@ -1,4 +1,4 @@
-import yfinance as yf
+import requests
 import pandas as pd
 from flask import Flask
 import threading
@@ -12,16 +12,13 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # CONFIGURACIÓN
 # -------------------
 TOKEN = "8172753785:AAF0pHsdL_9G3P6oR5MaY4799s_TjmR_eJQ"
+TD_API_KEY = "9f502fd5361c4e22ae6379b01ad18b09"
 
 # Lista de usuarios autorizados
 CHAT_IDS = ["7590209265", "8329147064"]
 
-activo_yahoo = "GC=F"   # Futuros COMEX
-umbral_resistencia = 2000
+# Parámetros técnicos
 rsi_high, rsi_low = 70, 30
-ajuste_cfd_manual = None
-
-# Control de duplicados de oportunidades
 ultima_oportunidad = {"mensaje": None, "hora": datetime.min}
 
 
@@ -29,37 +26,39 @@ ultima_oportunidad = {"mensaje": None, "hora": datetime.min}
 # FUNCIONES DE PRECIOS
 # -------------------
 def obtener_precio_actual():
+    """Precio spot desde Twelve Data"""
     try:
-        df = yf.download(activo_yahoo, period="1d", interval="1m", auto_adjust=True)
-        if not df.empty:
-            return df["Close"].iloc[-1].item()
+        url = f"https://api.twelvedata.com/price?symbol=XAU/USD&apikey={TD_API_KEY}"
+        r = requests.get(url).json()
+        if "price" in r:
+            return float(r["price"])
     except Exception as e:
-        print("Error Yahoo precio:", e)
+        print("Error Twelve Data precio:", e)
     return None
 
 
-def calcular_ajuste_cfd():
-    global ajuste_cfd_manual
-    if ajuste_cfd_manual is not None:
-        return ajuste_cfd_manual
+def obtener_velas(interval="1min", outputsize=200):
+    """Obtiene velas desde Twelve Data (XAU/USD)"""
     try:
-        df = yf.download("GC=F", period="1d", interval="1m", auto_adjust=True)
-        if not df.empty:
-            precio_futuros = df["Close"].iloc[-1].item()
-            return (precio_futuros - 23) - precio_futuros
+        url = (
+            f"https://api.twelvedata.com/time_series?"
+            f"symbol=XAU/USD&interval={interval}&outputsize={outputsize}&apikey={TD_API_KEY}"
+        )
+        r = requests.get(url).json()
+        if "values" not in r:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(r["values"])
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df = df.sort_values("datetime")
+        df = df.set_index("datetime")
+        df = df.astype(float)
+        return df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close"})
     except Exception as e:
-        print("Error calculando ajuste:", e)
-    return -23
+        print(f"Error obteniendo velas {interval}:", e)
+        return pd.DataFrame()
 
 
-def ajustar_a_cfd(precio):
-    ajuste = calcular_ajuste_cfd()
-    return precio + ajuste if precio else None
-
-
-# -------------------
-# INDICADORES TÉCNICOS
-# -------------------
 def calcular_indicadores(df):
     if df.empty:
         return df
@@ -78,9 +77,9 @@ def calcular_indicadores(df):
 
 def obtener_multiframe():
     frames = {
-        "1m": yf.download(activo_yahoo, period="1d", interval="1m", auto_adjust=True),
-        "5m": yf.download(activo_yahoo, period="3d", interval="5m", auto_adjust=True),
-        "15m": yf.download(activo_yahoo, period="5d", interval="15m", auto_adjust=True),
+        "1m": obtener_velas("1min", 200),
+        "5m": obtener_velas("5min", 200),
+        "15m": obtener_velas("15min", 200),
     }
     for key in frames:
         frames[key] = calcular_indicadores(frames[key])
@@ -97,10 +96,9 @@ def analizar_oportunidad(frames):
             señales.append(f"{tf}: ⚠️ Sin datos disponibles")
             continue
 
-        precio = df["Close"].iloc[-1].item()
-        ema20 = df["EMA20"].iloc[-1].item()
-        ema50 = df["EMA50"].iloc[-1].item()
-        rsi = df["RSI"].iloc[-1].item()
+        ema20 = df["EMA20"].iloc[-1]
+        ema50 = df["EMA50"].iloc[-1]
+        rsi = df["RSI"].iloc[-1]
 
         if ema20 > ema50 and rsi < 65:
             señales.append(f"{tf}: ✅ posible COMPRA (EMA20>EMA50, RSI={rsi:.1f})")
@@ -113,11 +111,11 @@ def analizar_oportunidad(frames):
     sells = sum("VENTA" in s for s in señales)
 
     if buys >= 2:
-        return ["🚀 Señal de **COMPRA** confirmada en varios marcos"] + señales
+        return ["🚀 Señal de **COMPRA** confirmada"] + señales
     elif sells >= 2:
-        return ["🔻 Señal de **VENTA** confirmada en varios marcos"] + señales
+        return ["🔻 Señal de **VENTA** confirmada"] + señales
     else:
-        return ["🤔 Señal indecisa"] + señales
+        return ["🤔 Mercado indeciso"] + señales
 
 
 # -------------------
@@ -127,27 +125,24 @@ def generar_recomendacion(signal, spot):
     if not spot:
         return "⚠️ No se pudo calcular recomendación (sin precio actual)"
 
-    spot_cfd = ajustar_a_cfd(spot)
-    df = yf.download(activo_yahoo, period="5d", interval="15m", auto_adjust=True).dropna()
+    df = obtener_velas("15min", 200)
+    if df.empty or len(df) < 20:
+        return "⚠️ Datos insuficientes para ATR"
 
-    high = pd.Series(df["High"].values.ravel(), index=df.index)
-    low = pd.Series(df["Low"].values.ravel(), index=df.index)
-    close = pd.Series(df["Close"].values.ravel(), index=df.index)
+    high, low, close = df["High"], df["Low"], df["Close"]
+    atr = AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1]
 
-    atr = AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1].item()
-    soporte = df["Low"].min(skipna=True).item()
-    resistencia = df["High"].max(skipna=True).item()
+    soporte = df["Low"].tail(50).min(skipna=True)
+    resistencia = df["High"].tail(50).max(skipna=True)
 
     if "COMPRA" in signal[0]:
-        entrada = spot_cfd
-        sl = max(entrada - atr, soporte)
-        tp = min(entrada + 2*atr, resistencia)
-        return f"📈 Recomendación CFD: COMPRA\n🎯 Entrada: {entrada:.2f}\n🛑 SL: {sl:.2f}\n✅ TP: {tp:.2f} (ATR={atr:.2f})"
+        sl = max(spot - atr, soporte)
+        tp = min(spot + 2 * atr, resistencia)
+        return f"📈 COMPRA CFD\nEntrada: {spot:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f} (ATR={atr:.2f})"
     elif "VENTA" in signal[0]:
-        entrada = spot_cfd
-        sl = min(entrada + atr, resistencia)
-        tp = max(entrada - 2*atr, soporte)
-        return f"📉 Recomendación CFD: VENTA\n🎯 Entrada: {entrada:.2f}\n🛑 SL: {sl:.2f}\n✅ TP: {tp:.2f} (ATR={atr:.2f})"
+        sl = min(spot + atr, resistencia)
+        tp = max(spot - 2 * atr, soporte)
+        return f"📉 VENTA CFD\nEntrada: {spot:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f} (ATR={atr:.2f})"
     else:
         return "🤔 Mercado con incertidumbre."
 
@@ -162,7 +157,7 @@ async def revisar_mercado(context: ContextTypes.DEFAULT_TYPE):
     mensajes = []
 
     if spot:
-        mensajes.append(f"📊 Precio actual GC=F: {spot:.2f} USD (ajuste CFD aplicado)")
+        mensajes.append(f"📊 Precio actual XAU/USD: {spot:.2f} USD")
     mensajes.extend(señales)
     mensajes.append(generar_recomendacion(señales, spot))
 
@@ -194,7 +189,7 @@ async def price(update, context):
     frames = obtener_multiframe()
     señales = analizar_oportunidad(frames)
     msg = generar_recomendacion(señales, spot)
-    await update.message.reply_text("📊 Precio actual:\n" + msg)
+    await update.message.reply_text(f"📊 Precio spot: {spot:.2f} USD\n" + msg)
 
 
 async def opportunity(update, context):
@@ -221,6 +216,19 @@ async def listids(update, context):
     await update.message.reply_text("📋 Lista de chat_ids autorizados:\n" + "\n".join(CHAT_IDS))
 
 
+async def help_cmd(update, context):
+    help_text = (
+        "🤖 Bot de Oro CFD\n\n"
+        "Comandos disponibles:\n"
+        "/price → Ver precio actual y recomendación\n"
+        "/opportunity → Ver oportunidad actual\n"
+        "/addid <id> → Añadir chat_id autorizado\n"
+        "/listids → Ver todos los chat_ids autorizados\n"
+        "/help → Mostrar esta ayuda"
+    )
+    await update.message.reply_text(help_text)
+
+
 # -------------------
 # MAIN
 # -------------------
@@ -232,6 +240,7 @@ def main():
     application.add_handler(CommandHandler("opportunity", opportunity))
     application.add_handler(CommandHandler("addid", addid))
     application.add_handler(CommandHandler("listids", listids))
+    application.add_handler(CommandHandler("help", help_cmd))
 
     # Jobs
     job_queue = application.job_queue
