@@ -123,33 +123,50 @@ def analizar_oportunidad(frames):
 def generar_recomendacion(signal, spot):
     if not spot:
         return "⚠️ No se pudo calcular recomendación (sin precio actual)"
-    try:
-        # Solo usamos los últimos datos de 15m
-        url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval=15min&outputsize=100&apikey={API_KEY_TWELVE}"
-        r = requests.get(url).json()
-        if "values" not in r:
-            return "⚠️ Datos insuficientes"
-        df = pd.DataFrame(r["values"])
-        df = df.iloc[::-1].reset_index(drop=True)
-        high, low, close = df["high"].astype(float), df["low"].astype(float), df["close"].astype(float)
-        atr = AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1]
-        soporte = low.min()
-        resistencia = high.max()
 
-        if "COMPRA" in signal[0]:
-            entrada = spot
-            sl = max(entrada - atr, soporte)
-            tp = min(entrada + 2*atr, resistencia)
-            return f"📈 COMPRA CFD\nEntrada: {entrada:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f} (ATR={atr:.2f})"
-        elif "VENTA" in signal[0]:
-            entrada = spot
-            sl = min(entrada + atr, resistencia)
-            tp = max(entrada - 2*atr, soporte)
-            return f"📉 VENTA CFD\nEntrada: {entrada:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f} (ATR={atr:.2f})"
-        else:
-            return "🤔 Mercado indeciso."
-    except Exception as e:
-        return f"⚠️ Error recomendación: {e}"
+    spot_cfd = ajustar_a_cfd(spot)
+
+    df = yf.download(activo_yahoo, period="10d", interval="15m", auto_adjust=True).dropna()
+    if df.empty or len(df) < 30:
+        return "⚠️ Datos insuficientes para calcular recomendación"
+
+    high, low, close = df["High"], df["Low"], df["Close"]
+
+    # ATR dinámico
+    atr_series = AverageTrueRange(high, low, close, window=14).average_true_range()
+    atr = atr_series.iloc[-1].item()
+
+    # Rango medio diario (ADR)
+    df_daily = yf.download(activo_yahoo, period="10d", interval="1d", auto_adjust=True).dropna()
+    adr = (df_daily["High"] - df_daily["Low"]).mean().item()
+
+    soporte = low.min(skipna=True).item()
+    resistencia = high.max(skipna=True).item()
+
+    # Multiplicador dinámico ATR (más prudente si mercado lento)
+    mult = 1.5 if atr < adr/2 else 2.0
+
+    if "COMPRA" in signal[0]:
+        entrada = spot_cfd
+        tp = entrada + mult * atr
+        sl = entrada - atr
+
+        # Validar TP alcanzable
+        if tp > resistencia or (tp - entrada) > adr:
+            return f"📈 COMPRA detectada, pero TP poco realista (resistencia cercana o fuera del rango ADR). Mejor esperar."
+        return f"📈 COMPRA CFD\n🎯 Entrada: {entrada:.2f}\n🛑 SL: {sl:.2f}\n✅ TP: {tp:.2f} (ATR={atr:.2f}, ADR={adr:.2f})"
+
+    elif "VENTA" in signal[0]:
+        entrada = spot_cfd
+        tp = entrada - mult * atr
+        sl = entrada + atr
+
+        if tp < soporte or (entrada - tp) > adr:
+            return f"📉 VENTA detectada, pero TP poco realista (soporte cercano o fuera del rango ADR). Mejor esperar."
+        return f"📉 VENTA CFD\n🎯 Entrada: {entrada:.2f}\n🛑 SL: {sl:.2f}\n✅ TP: {tp:.2f} (ATR={atr:.2f}, ADR={adr:.2f})"
+
+    else:
+        return "🤔 Mercado con incertidumbre."
 
 # -------------------
 # TAREAS PROGRAMADAS
