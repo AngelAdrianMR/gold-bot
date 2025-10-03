@@ -16,7 +16,6 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN", "PON_AQUI_TU_TOKEN")
 CHAT_IDS = ["7590209265", "8329147064"]
 
 activo_futuros = "GC=F"
-# Parámetros configurables
 config = {
     "rsi_high": 70,
     "rsi_low": 30,
@@ -24,7 +23,6 @@ config = {
     "ajuste_cfd_manual": None
 }
 
-# Última oportunidad detectada
 ultima_oportunidad = {"direccion": None, "precio": None, "hora": datetime.min}
 
 # -------------------
@@ -36,13 +34,13 @@ def obtener_precio_cfd():
         fut = yf.download("GC=F", period="1d", interval="1m", auto_adjust=True)
         if fut.empty:
             return None
-        precio_fut = fut["Close"].iloc[-1].item()  # ✅ evita FutureWarning
+        precio_fut = fut["Close"].iloc[-1].item()
 
-        # Ajuste manual
+        # ✅ Ajuste manual = precio directo
         if config["ajuste_cfd_manual"] is not None:
-            return float(precio_fut + config["ajuste_cfd_manual"])
+            return float(config["ajuste_cfd_manual"])
 
-        # Intentar proxies
+        # Proxies (spot o GLD)
         for proxy in ["XAU=X", "GLD"]:
             try:
                 spot = yf.download(proxy, period="1d", interval="1m", auto_adjust=True)
@@ -53,7 +51,7 @@ def obtener_precio_cfd():
             except Exception:
                 continue
 
-        # Fallback
+        # Fallback fijo
         return float(precio_fut - 23)
 
     except Exception as e:
@@ -61,7 +59,7 @@ def obtener_precio_cfd():
         return None
 
 # -------------------
-# INDICADORES TÉCNICOS
+# INDICADORES
 # -------------------
 def calcular_indicadores(df):
     if df.empty:
@@ -129,13 +127,16 @@ def generar_recomendacion(signal, spot):
 
     try:
         df = yf.download(activo_futuros, period="5d", interval="15m", auto_adjust=True).dropna()
-        if df.empty or len(df) < 20:  # ✅ evita error cuando no hay suficientes velas
+        if df.empty or len(df) < 20:
             return "⚠️ No hay suficientes datos para ATR"
 
-        high, low, close = df["High"], df["Low"], df["Close"]
+        # ✅ Forzar series con índice
+        high = pd.Series(df["High"].values, index=df.index)
+        low = pd.Series(df["Low"].values, index=df.index)
+        close = pd.Series(df["Close"].values, index=df.index)
 
         atr_series = AverageTrueRange(high, low, close, window=14).average_true_range()
-        if atr_series.empty:
+        if atr_series is None or atr_series.empty:
             return "⚠️ ATR no disponible"
 
         atr = atr_series.iloc[-1]
@@ -147,11 +148,13 @@ def generar_recomendacion(signal, spot):
             sl = max(entrada - atr, soporte)
             tp = min(entrada + 2*atr, resistencia)
             return f"📈 CFD COMPRA\nEntrada: {entrada:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f} (ATR={atr:.2f})"
+
         elif "VENTA" in signal[0]:
             entrada = spot
             sl = min(entrada + atr, resistencia)
             tp = max(entrada - 2*atr, soporte)
             return f"📉 CFD VENTA\nEntrada: {entrada:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f} (ATR={atr:.2f})"
+
         else:
             return "🤔 Mercado sin dirección clara."
     except Exception as e:
@@ -177,7 +180,7 @@ def construir_mensaje():
 # TAREAS PROGRAMADAS
 # -------------------
 async def revisar_mercado(context: ContextTypes.DEFAULT_TYPE):
-    if datetime.now(timezone.utc).weekday() >= 5:  # Sábado o domingo
+    if datetime.now(timezone.utc).weekday() >= 5:
         return
     msg = construir_mensaje()
     for chat_id in CHAT_IDS:
@@ -234,7 +237,7 @@ async def start(update, context):
     )
     await update.message.reply_text(help_text)
 
-help_cmd = start  # alias
+help_cmd = start
 
 async def price(update, context): 
     await update.message.reply_text(construir_mensaje())
@@ -276,12 +279,10 @@ async def set_config(update, context):
 # -------------------
 def main():
     application = Application.builder().token(TOKEN).build()
-    # Handlers cortos
     application.add_handler(CommandHandler("p", price))
     application.add_handler(CommandHandler("o", opportunity))
     application.add_handler(CommandHandler("c", show_config))
     application.add_handler(CommandHandler("s", set_config))
-    # Handlers largos
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("price", price))
@@ -289,10 +290,11 @@ def main():
     application.add_handler(CommandHandler("addid", addid))
     application.add_handler(CommandHandler("config", show_config))
     application.add_handler(CommandHandler("set", set_config))
-    # Jobs
+
     job_queue = application.job_queue
     job_queue.run_repeating(revisar_mercado, interval=1800, first=10)
     job_queue.run_repeating(revisar_oportunidad, interval=300, first=60)
+
     application.run_polling()
 
 # -------------------
