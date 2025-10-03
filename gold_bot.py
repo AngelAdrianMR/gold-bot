@@ -124,49 +124,65 @@ def generar_recomendacion(signal, spot):
     if not spot:
         return "⚠️ No se pudo calcular recomendación (sin precio actual)"
 
-    spot_cfd = ajustar_a_cfd(spot)
+    spot_cfd = spot if ajuste_cfd_manual is None else spot + ajuste_cfd_manual
 
-    df = yf.download(activo_yahoo, period="10d", interval="15m", auto_adjust=True).dropna()
-    if df.empty or len(df) < 30:
-        return "⚠️ Datos insuficientes para calcular recomendación"
+    try:
+        # 📊 Datos de 15m
+        url_15m = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval=15min&outputsize=200&apikey={API_KEY_TWELVE}"
+        r = requests.get(url_15m).json()
+        if "values" not in r:
+            return "⚠️ Datos insuficientes para recomendación (15m)"
+        df = pd.DataFrame(r["values"])
+        df = df.iloc[::-1].reset_index(drop=True)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+        df["close"] = df["close"].astype(float)
 
-    high, low, close = df["High"], df["Low"], df["Close"]
+        if len(df) < 30:
+            return "⚠️ Muy pocas velas para ATR"
 
-    # ATR dinámico
-    atr_series = AverageTrueRange(high, low, close, window=14).average_true_range()
-    atr = atr_series.iloc[-1].item()
+        high, low, close = df["high"], df["low"], df["close"]
 
-    # Rango medio diario (ADR)
-    df_daily = yf.download(activo_yahoo, period="10d", interval="1d", auto_adjust=True).dropna()
-    adr = (df_daily["High"] - df_daily["Low"]).mean().item()
+        atr_series = AverageTrueRange(high, low, close, window=14).average_true_range()
+        atr = atr_series.iloc[-1]
 
-    soporte = low.min(skipna=True).item()
-    resistencia = high.max(skipna=True).item()
+        # 📊 Datos diarios para ADR
+        url_daily = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval=1day&outputsize=30&apikey={API_KEY_TWELVE}"
+        r_daily = requests.get(url_daily).json()
+        if "values" not in r_daily:
+            return "⚠️ Datos diarios insuficientes"
+        df_daily = pd.DataFrame(r_daily["values"])
+        df_daily = df_daily.iloc[::-1].reset_index(drop=True)
+        df_daily["high"] = df_daily["high"].astype(float)
+        df_daily["low"] = df_daily["low"].astype(float)
+        adr = (df_daily["high"] - df_daily["low"]).mean()
 
-    # Multiplicador dinámico ATR (más prudente si mercado lento)
-    mult = 1.5 if atr < adr/2 else 2.0
+        soporte = low.min(skipna=True)
+        resistencia = high.max(skipna=True)
 
-    if "COMPRA" in signal[0]:
-        entrada = spot_cfd
-        tp = entrada + mult * atr
-        sl = entrada - atr
+        mult = 1.5 if atr < adr / 2 else 2.0
 
-        # Validar TP alcanzable
-        if tp > resistencia or (tp - entrada) > adr:
-            return f"📈 COMPRA detectada, pero TP poco realista (resistencia cercana o fuera del rango ADR). Mejor esperar."
-        return f"📈 COMPRA CFD\n🎯 Entrada: {entrada:.2f}\n🛑 SL: {sl:.2f}\n✅ TP: {tp:.2f} (ATR={atr:.2f}, ADR={adr:.2f})"
+        if "COMPRA" in signal[0]:
+            entrada = spot_cfd
+            tp = entrada + mult * atr
+            sl = entrada - atr
+            if tp > resistencia or (tp - entrada) > adr:
+                return f"📈 COMPRA detectada, pero TP poco realista.\nEntrada {entrada:.2f}"
+            return f"📈 COMPRA CFD\n🎯 Entrada: {entrada:.2f}\n🛑 SL: {sl:.2f}\n✅ TP: {tp:.2f} (ATR={atr:.2f}, ADR={adr:.2f})"
 
-    elif "VENTA" in signal[0]:
-        entrada = spot_cfd
-        tp = entrada - mult * atr
-        sl = entrada + atr
+        elif "VENTA" in signal[0]:
+            entrada = spot_cfd
+            tp = entrada - mult * atr
+            sl = entrada + atr
+            if tp < soporte or (entrada - tp) > adr:
+                return f"📉 VENTA detectada, pero TP poco realista.\nEntrada {entrada:.2f}"
+            return f"📉 VENTA CFD\n🎯 Entrada: {entrada:.2f}\n🛑 SL: {sl:.2f}\n✅ TP: {tp:.2f} (ATR={atr:.2f}, ADR={adr:.2f})"
 
-        if tp < soporte or (entrada - tp) > adr:
-            return f"📉 VENTA detectada, pero TP poco realista (soporte cercano o fuera del rango ADR). Mejor esperar."
-        return f"📉 VENTA CFD\n🎯 Entrada: {entrada:.2f}\n🛑 SL: {sl:.2f}\n✅ TP: {tp:.2f} (ATR={atr:.2f}, ADR={adr:.2f})"
+        else:
+            return "🤔 Mercado con incertidumbre."
 
-    else:
-        return "🤔 Mercado con incertidumbre."
+    except Exception as e:
+        return f"⚠️ Error en recomendación: {e}"
 
 # -------------------
 # TAREAS PROGRAMADAS
