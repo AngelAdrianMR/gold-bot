@@ -12,57 +12,48 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # CONFIGURACIÓN
 # -------------------
 TOKEN = "8172753785:AAF0pHsdL_9G3P6oR5MaY4799s_TjmR_eJQ"
-TD_API_KEY = "9f502fd5361c4e22ae6379b01ad18b09"
-
-# Lista de usuarios autorizados
 CHAT_IDS = ["7590209265", "8329147064"]
 
-# Parámetros técnicos
-rsi_high, rsi_low = 70, 30
-ultima_oportunidad = {"mensaje": None, "hora": datetime.min}
+API_KEY_TWELVE = "9f502fd5361c4e22ae6379b01ad18b09"
+SYMBOL = "XAU/USD"
 
+# Variables globales
+ajuste_cfd_manual = None
+ultimo_spot = None
+ultima_oportunidad = {"mensaje": None, "hora": datetime.min}
 
 # -------------------
 # FUNCIONES DE PRECIOS
 # -------------------
-def obtener_precio_actual():
-    """Precio spot desde Twelve Data"""
+def obtener_precio_twelve():
+    """Obtiene el precio spot en tiempo real de XAU/USD desde Twelve Data"""
     try:
-        url = f"https://api.twelvedata.com/price?symbol=XAU/USD&apikey={TD_API_KEY}"
+        url = f"https://api.twelvedata.com/price?symbol={SYMBOL}&apikey={API_KEY_TWELVE}"
         r = requests.get(url).json()
         if "price" in r:
             return float(r["price"])
     except Exception as e:
-        print("Error Twelve Data precio:", e)
+        print("Error Twelve Data:", e)
     return None
 
+def obtener_precio_cfd():
+    """Aplica el ajuste manual (si existe) al precio spot"""
+    global ultimo_spot, ajuste_cfd_manual
+    spot = obtener_precio_twelve()
+    ultimo_spot = spot
+    if not spot:
+        return None
+    if ajuste_cfd_manual is not None:
+        return spot + ajuste_cfd_manual
+    return spot
 
-def obtener_velas(interval="1min", outputsize=200):
-    """Obtiene velas desde Twelve Data (XAU/USD)"""
-    try:
-        url = (
-            f"https://api.twelvedata.com/time_series?"
-            f"symbol=XAU/USD&interval={interval}&outputsize={outputsize}&apikey={TD_API_KEY}"
-        )
-        r = requests.get(url).json()
-        if "values" not in r:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(r["values"])
-        df["datetime"] = pd.to_datetime(df["datetime"])
-        df = df.sort_values("datetime")
-        df = df.set_index("datetime")
-        df = df.astype(float)
-        return df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close"})
-    except Exception as e:
-        print(f"Error obteniendo velas {interval}:", e)
-        return pd.DataFrame()
-
-
+# -------------------
+# INDICADORES TÉCNICOS
+# -------------------
 def calcular_indicadores(df):
     if df.empty:
         return df
-    close = df["Close"].squeeze()
+    close = df["close"].squeeze()
     df["EMA20"] = EMAIndicator(close, window=20).ema_indicator()
     df["EMA50"] = EMAIndicator(close, window=50).ema_indicator()
     df["RSI"] = RSIIndicator(close, window=14).rsi()
@@ -74,17 +65,27 @@ def calcular_indicadores(df):
     df["Boll_Lower"] = boll.bollinger_lband()
     return df
 
-
 def obtener_multiframe():
-    frames = {
-        "1m": obtener_velas("1min", 200),
-        "5m": obtener_velas("5min", 200),
-        "15m": obtener_velas("15min", 200),
-    }
-    for key in frames:
-        frames[key] = calcular_indicadores(frames[key])
+    """Descarga datos de 3 marcos temporales desde Twelve Data"""
+    frames = {}
+    intervals = {"1m": "1min", "5m": "5min", "15m": "15min"}
+    for key, val in intervals.items():
+        try:
+            url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval={val}&outputsize=200&apikey={API_KEY_TWELVE}"
+            r = requests.get(url).json()
+            if "values" in r:
+                df = pd.DataFrame(r["values"])
+                df = df.rename(columns={"datetime":"time"})
+                df = df.iloc[::-1].reset_index(drop=True)  # ordenar por tiempo
+                df["close"] = df["close"].astype(float)
+                df["high"] = df["high"].astype(float)
+                df["low"] = df["low"].astype(float)
+                df = calcular_indicadores(df)
+                frames[key] = df
+        except Exception as e:
+            print(f"Error obteniendo {key}:", e)
+            frames[key] = pd.DataFrame()
     return frames
-
 
 # -------------------
 # ANÁLISIS
@@ -95,7 +96,6 @@ def analizar_oportunidad(frames):
         if df.empty:
             señales.append(f"{tf}: ⚠️ Sin datos disponibles")
             continue
-
         ema20 = df["EMA20"].iloc[-1]
         ema50 = df["EMA50"].iloc[-1]
         rsi = df["RSI"].iloc[-1]
@@ -115,8 +115,7 @@ def analizar_oportunidad(frames):
     elif sells >= 2:
         return ["🔻 Señal de **VENTA** confirmada"] + señales
     else:
-        return ["🤔 Mercado indeciso"] + señales
-
+        return ["🤔 Señal indecisa"] + señales
 
 # -------------------
 # RECOMENDACIONES
@@ -124,51 +123,56 @@ def analizar_oportunidad(frames):
 def generar_recomendacion(signal, spot):
     if not spot:
         return "⚠️ No se pudo calcular recomendación (sin precio actual)"
+    try:
+        # Solo usamos los últimos datos de 15m
+        url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval=15min&outputsize=100&apikey={API_KEY_TWELVE}"
+        r = requests.get(url).json()
+        if "values" not in r:
+            return "⚠️ Datos insuficientes"
+        df = pd.DataFrame(r["values"])
+        df = df.iloc[::-1].reset_index(drop=True)
+        high, low, close = df["high"].astype(float), df["low"].astype(float), df["close"].astype(float)
+        atr = AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1]
+        soporte = low.min()
+        resistencia = high.max()
 
-    df = obtener_velas("15min", 200)
-    if df.empty or len(df) < 20:
-        return "⚠️ Datos insuficientes para ATR"
-
-    high, low, close = df["High"], df["Low"], df["Close"]
-    atr = AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1]
-
-    soporte = df["Low"].tail(50).min(skipna=True)
-    resistencia = df["High"].tail(50).max(skipna=True)
-
-    if "COMPRA" in signal[0]:
-        sl = max(spot - atr, soporte)
-        tp = min(spot + 2 * atr, resistencia)
-        return f"📈 COMPRA CFD\nEntrada: {spot:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f} (ATR={atr:.2f})"
-    elif "VENTA" in signal[0]:
-        sl = min(spot + atr, resistencia)
-        tp = max(spot - 2 * atr, soporte)
-        return f"📉 VENTA CFD\nEntrada: {spot:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f} (ATR={atr:.2f})"
-    else:
-        return "🤔 Mercado con incertidumbre."
-
+        if "COMPRA" in signal[0]:
+            entrada = spot
+            sl = max(entrada - atr, soporte)
+            tp = min(entrada + 2*atr, resistencia)
+            return f"📈 COMPRA CFD\nEntrada: {entrada:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f} (ATR={atr:.2f})"
+        elif "VENTA" in signal[0]:
+            entrada = spot
+            sl = min(entrada + atr, resistencia)
+            tp = max(entrada - 2*atr, soporte)
+            return f"📉 VENTA CFD\nEntrada: {entrada:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f} (ATR={atr:.2f})"
+        else:
+            return "🤔 Mercado indeciso."
+    except Exception as e:
+        return f"⚠️ Error recomendación: {e}"
 
 # -------------------
 # TAREAS PROGRAMADAS
 # -------------------
 async def revisar_mercado(context: ContextTypes.DEFAULT_TYPE):
-    spot = obtener_precio_actual()
+    spot = obtener_precio_cfd()
     frames = obtener_multiframe()
     señales = analizar_oportunidad(frames)
-    mensajes = []
+    recomendacion = generar_recomendacion(señales, spot)
 
+    mensajes = []
     if spot:
         mensajes.append(f"📊 Precio actual XAU/USD: {spot:.2f} USD")
     mensajes.extend(señales)
-    mensajes.append(generar_recomendacion(señales, spot))
+    mensajes.append(recomendacion)
 
     for chat_id in CHAT_IDS:
         for msg in mensajes:
             await context.bot.send_message(chat_id=chat_id, text=msg)
 
-
 async def revisar_oportunidad(context: ContextTypes.DEFAULT_TYPE):
     global ultima_oportunidad
-    spot = obtener_precio_actual()
+    spot = obtener_precio_cfd()
     frames = obtener_multiframe()
     señales = analizar_oportunidad(frames)
     msg = generar_recomendacion(señales, spot)
@@ -180,25 +184,22 @@ async def revisar_oportunidad(context: ContextTypes.DEFAULT_TYPE):
         for chat_id in CHAT_IDS:
             await context.bot.send_message(chat_id=chat_id, text="🚨 OPORTUNIDAD DETECTADA 🚨\n" + msg)
 
-
 # -------------------
-# COMANDOS
+# COMANDOS TELEGRAM
 # -------------------
 async def price(update, context):
-    spot = obtener_precio_actual()
+    spot = obtener_precio_cfd()
     frames = obtener_multiframe()
     señales = analizar_oportunidad(frames)
     msg = generar_recomendacion(señales, spot)
-    await update.message.reply_text(f"📊 Precio spot: {spot:.2f} USD\n" + msg)
-
+    await update.message.reply_text(f"📊 Precio actual: {spot:.2f} USD\n" + "\n".join(señales) + "\n" + msg)
 
 async def opportunity(update, context):
-    spot = obtener_precio_actual()
+    spot = obtener_precio_cfd()
     frames = obtener_multiframe()
     señales = analizar_oportunidad(frames)
     msg = generar_recomendacion(señales, spot)
-    await update.message.reply_text("📊 Oportunidad actual:\n" + msg)
-
+    await update.message.reply_text("📊 Oportunidad actual:\n" + "\n".join(señales) + "\n" + msg)
 
 async def addid(update, context):
     if context.args:
@@ -211,23 +212,39 @@ async def addid(update, context):
     else:
         await update.message.reply_text("Uso: /addid <id>")
 
-
 async def listids(update, context):
     await update.message.reply_text("📋 Lista de chat_ids autorizados:\n" + "\n".join(CHAT_IDS))
 
+async def set_precio(update, context):
+    global ajuste_cfd_manual, ultimo_spot
+    if not context.args:
+        await update.message.reply_text("Uso: /setprecio <valor>")
+        return
+    try:
+        precio_etoro = float(context.args[0])
+        if ultimo_spot:
+            ajuste_cfd_manual = precio_etoro - ultimo_spot
+            await update.message.reply_text(
+                f"✅ Ajuste aplicado: {ajuste_cfd_manual:.2f} USD\n"
+                f"(spot={ultimo_spot:.2f}, eToro={precio_etoro:.2f})"
+            )
+        else:
+            await update.message.reply_text("⚠️ No hay spot cargado aún, prueba en 1 min.")
+    except ValueError:
+        await update.message.reply_text("⚠️ Valor no válido.")
 
 async def help_cmd(update, context):
     help_text = (
         "🤖 Bot de Oro CFD\n\n"
         "Comandos disponibles:\n"
-        "/price → Ver precio actual y recomendación\n"
-        "/opportunity → Ver oportunidad actual\n"
-        "/addid <id> → Añadir chat_id autorizado\n"
-        "/listids → Ver todos los chat_ids autorizados\n"
-        "/help → Mostrar esta ayuda"
+        "/price → Ver precio e indicadores\n"
+        "/opportunity → Revisar oportunidad\n"
+        "/setprecio <valor> → Ajustar al precio de eToro\n"
+        "/addid <id> → Añadir usuario\n"
+        "/listids → Listar usuarios autorizados\n"
+        "/help → Ver esta ayuda"
     )
     await update.message.reply_text(help_text)
-
 
 # -------------------
 # MAIN
@@ -235,22 +252,22 @@ async def help_cmd(update, context):
 def main():
     application = Application.builder().token(TOKEN).build()
 
-    # Handlers
     application.add_handler(CommandHandler("price", price))
     application.add_handler(CommandHandler("opportunity", opportunity))
     application.add_handler(CommandHandler("addid", addid))
     application.add_handler(CommandHandler("listids", listids))
+    application.add_handler(CommandHandler("setprecio", set_precio))
     application.add_handler(CommandHandler("help", help_cmd))
 
-    # Jobs
     job_queue = application.job_queue
     job_queue.run_repeating(revisar_mercado, interval=1800, first=5)
     job_queue.run_repeating(revisar_oportunidad, interval=300, first=30)
 
     application.run_polling()
 
-
+# -------------------
 # FLASK KEEP-ALIVE
+# -------------------
 app = Flask(__name__)
 
 @app.route('/')
