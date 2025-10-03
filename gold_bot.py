@@ -7,54 +7,46 @@ from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, MACD
 from ta.volatility import BollingerBands, AverageTrueRange
 from telegram.ext import Application, CommandHandler, ContextTypes
+import os
 
 # -------------------
 # CONFIGURACIÓN
 # -------------------
-TOKEN = "8172753785:AAF0pHsdL_9G3P6oR5MaY4799s_TjmR_eJQ"
-
-# Lista de usuarios autorizados
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "PON_AQUI_TU_TOKEN")
 CHAT_IDS = ["7590209265", "8329147064"]
 
-activo_yahoo = "GC=F"   # Futuros COMEX
-umbral_resistencia = 2000
-rsi_high, rsi_low = 70, 30
-ajuste_cfd_manual = None
+activo_futuros = "GC=F"
+activo_spot = "XAUUSD=X"  # Oro spot (más cercano a CFD)
 
-# Control de duplicados de oportunidades
+# Parámetros configurables
+config = {
+    "rsi_high": 70,
+    "rsi_low": 30,
+    "umbral_resistencia": 2000,
+    "ajuste_cfd_manual": None
+}
+
 ultima_oportunidad = {"mensaje": None, "hora": datetime.min}
 
 
 # -------------------
 # FUNCIONES DE PRECIOS
 # -------------------
-def obtener_precio_actual():
+def obtener_precio_cfd():
     try:
-        df = yf.download(activo_yahoo, period="1d", interval="1m", auto_adjust=True)
-        if not df.empty:
-            return df["Close"].iloc[-1].item()
+        fut = yf.download(activo_futuros, period="1d", interval="1m", auto_adjust=True)
+        spot = yf.download(activo_spot, period="1d", interval="1m", auto_adjust=True)
+        if fut.empty or spot.empty:
+            return None
+        precio_fut = fut["Close"].iloc[-1]
+        precio_spot = spot["Close"].iloc[-1]
+        ajuste = precio_spot - precio_fut
+        if config["ajuste_cfd_manual"] is not None:
+            ajuste = config["ajuste_cfd_manual"]
+        return float(precio_fut + ajuste)
     except Exception as e:
-        print("Error Yahoo precio:", e)
-    return None
-
-
-def calcular_ajuste_cfd():
-    global ajuste_cfd_manual
-    if ajuste_cfd_manual is not None:
-        return ajuste_cfd_manual
-    try:
-        df = yf.download("GC=F", period="1d", interval="1m", auto_adjust=True)
-        if not df.empty:
-            precio_futuros = df["Close"].iloc[-1].item()
-            return (precio_futuros - 23) - precio_futuros
-    except Exception as e:
-        print("Error calculando ajuste:", e)
-    return -23
-
-
-def ajustar_a_cfd(precio):
-    ajuste = calcular_ajuste_cfd()
-    return precio + ajuste if precio else None
+        print("Error obteniendo precio CFD:", e)
+        return None
 
 
 # -------------------
@@ -78,9 +70,11 @@ def calcular_indicadores(df):
 
 def obtener_multiframe():
     frames = {
-        "1m": yf.download(activo_yahoo, period="1d", interval="1m", auto_adjust=True),
-        "5m": yf.download(activo_yahoo, period="3d", interval="5m", auto_adjust=True),
-        "15m": yf.download(activo_yahoo, period="5d", interval="15m", auto_adjust=True),
+        "1m": yf.download(activo_futuros, period="1d", interval="1m", auto_adjust=True),
+        "5m": yf.download(activo_futuros, period="3d", interval="5m", auto_adjust=True),
+        "15m": yf.download(activo_futuros, period="5d", interval="15m", auto_adjust=True),
+        "1h": yf.download(activo_futuros, period="1mo", interval="1h", auto_adjust=True),
+        "4h": yf.download(activo_futuros, period="3mo", interval="4h", auto_adjust=True),
     }
     for key in frames:
         frames[key] = calcular_indicadores(frames[key])
@@ -94,92 +88,93 @@ def analizar_oportunidad(frames):
     señales = []
     for tf, df in frames.items():
         if df.empty:
-            señales.append(f"{tf}: ⚠️ Sin datos disponibles")
+            señales.append(f"{tf}: ⚠️ Sin datos")
             continue
 
-        precio = df["Close"].iloc[-1].item()
-        ema20 = df["EMA20"].iloc[-1].item()
-        ema50 = df["EMA50"].iloc[-1].item()
-        rsi = df["RSI"].iloc[-1].item()
+        ema20 = df["EMA20"].iloc[-1]
+        ema50 = df["EMA50"].iloc[-1]
+        rsi = df["RSI"].iloc[-1]
 
-        if ema20 > ema50 and rsi < 65:
-            señales.append(f"{tf}: ✅ posible COMPRA (EMA20>EMA50, RSI={rsi:.1f})")
-        elif ema20 < ema50 and rsi > 35:
-            señales.append(f"{tf}: ❌ posible VENTA (EMA20<EMA50, RSI={rsi:.1f})")
+        if ema20 > ema50 and rsi < config["rsi_high"] - 5:
+            señales.append(f"{tf}: ✅ COMPRA (RSI={rsi:.1f})")
+        elif ema20 < ema50 and rsi > config["rsi_low"] + 5:
+            señales.append(f"{tf}: ❌ VENTA (RSI={rsi:.1f})")
         else:
-            señales.append(f"{tf}: 🤔 sin señal clara (RSI={rsi:.1f})")
+            señales.append(f"{tf}: 🤔 Incertidumbre (RSI={rsi:.1f})")
 
     buys = sum("COMPRA" in s for s in señales)
     sells = sum("VENTA" in s for s in señales)
 
     if buys >= 2:
-        return ["🚀 Señal de **COMPRA** confirmada en varios marcos"] + señales
+        return ["🚀 Señal de COMPRA confirmada"] + señales
     elif sells >= 2:
-        return ["🔻 Señal de **VENTA** confirmada en varios marcos"] + señales
+        return ["🔻 Señal de VENTA confirmada"] + señales
     else:
-        return ["🤔 Señal indecisa"] + señales
+        return ["🤔 Mercado indeciso"] + señales
 
 
-# -------------------
-# RECOMENDACIONES
-# -------------------
 def generar_recomendacion(signal, spot):
     if not spot:
-        return "⚠️ No se pudo calcular recomendación (sin precio actual)"
+        return "⚠️ Sin precio actual"
 
-    spot_cfd = ajustar_a_cfd(spot)
-    df = yf.download(activo_yahoo, period="5d", interval="15m", auto_adjust=True).dropna()
+    df = yf.download(activo_futuros, period="5d", interval="15m", auto_adjust=True).dropna()
+    if df.empty:
+        return "⚠️ No hay datos para recomendación"
 
-    high = pd.Series(df["High"].values.ravel(), index=df.index)
-    low = pd.Series(df["Low"].values.ravel(), index=df.index)
-    close = pd.Series(df["Close"].values.ravel(), index=df.index)
-
-    atr = AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1].item()
-    soporte = df["Low"].min(skipna=True).item()
-    resistencia = df["High"].max(skipna=True).item()
+    high, low, close = df["High"], df["Low"], df["Close"]
+    atr = AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1]
+    soporte = low.min(skipna=True)
+    resistencia = high.max(skipna=True)
 
     if "COMPRA" in signal[0]:
-        entrada = spot_cfd
+        entrada = spot
         sl = max(entrada - atr, soporte)
         tp = min(entrada + 2*atr, resistencia)
-        return f"📈 Recomendación CFD: COMPRA\n🎯 Entrada: {entrada:.2f}\n🛑 SL: {sl:.2f}\n✅ TP: {tp:.2f} (ATR={atr:.2f})"
+        return f"📈 CFD COMPRA\nEntrada: {entrada:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f} (ATR={atr:.2f})"
     elif "VENTA" in signal[0]:
-        entrada = spot_cfd
+        entrada = spot
         sl = min(entrada + atr, resistencia)
         tp = max(entrada - 2*atr, soporte)
-        return f"📉 Recomendación CFD: VENTA\n🎯 Entrada: {entrada:.2f}\n🛑 SL: {sl:.2f}\n✅ TP: {tp:.2f} (ATR={atr:.2f})"
+        return f"📉 CFD VENTA\nEntrada: {entrada:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f} (ATR={atr:.2f})"
     else:
-        return "🤔 Mercado con incertidumbre."
+        return "🤔 Mercado sin dirección clara."
+
+
+# -------------------
+# MENSAJE UNIFICADO
+# -------------------
+def construir_mensaje():
+    spot = obtener_precio_cfd()
+    frames = obtener_multiframe()
+    señales = analizar_oportunidad(frames)
+    recomendacion = generar_recomendacion(señales, spot)
+
+    mensaje = []
+    if spot:
+        mensaje.append(f"📊 Precio CFD actual: {spot:.2f} USD")
+    mensaje.extend(señales)
+    mensaje.append(recomendacion)
+    return "\n".join(mensaje)
 
 
 # -------------------
 # TAREAS PROGRAMADAS
 # -------------------
 async def revisar_mercado(context: ContextTypes.DEFAULT_TYPE):
-    spot = obtener_precio_actual()
-    frames = obtener_multiframe()
-    señales = analizar_oportunidad(frames)
-    mensajes = []
-
-    if spot:
-        mensajes.append(f"📊 Precio actual GC=F: {spot:.2f} USD (ajuste CFD aplicado)")
-    mensajes.extend(señales)
-    mensajes.append(generar_recomendacion(señales, spot))
-
+    if datetime.utcnow().weekday() >= 5:  # Sábado o domingo
+        return
+    msg = construir_mensaje()
     for chat_id in CHAT_IDS:
-        for msg in mensajes:
-            await context.bot.send_message(chat_id=chat_id, text=msg)
+        await context.bot.send_message(chat_id=chat_id, text=msg)
 
 
 async def revisar_oportunidad(context: ContextTypes.DEFAULT_TYPE):
     global ultima_oportunidad
-    spot = obtener_precio_actual()
-    frames = obtener_multiframe()
-    señales = analizar_oportunidad(frames)
-    msg = generar_recomendacion(señales, spot)
+    if datetime.utcnow().weekday() >= 5:
+        return
+    msg = construir_mensaje()
     ahora = datetime.now()
-
-    if ("COMPRA" in señales[0] or "VENTA" in señales[0]) and \
+    if ("COMPRA" in msg or "VENTA" in msg) and \
        (ultima_oportunidad["mensaje"] != msg or ahora - ultima_oportunidad["hora"] > timedelta(minutes=30)):
         ultima_oportunidad = {"mensaje": msg, "hora": ahora}
         for chat_id in CHAT_IDS:
@@ -189,12 +184,65 @@ async def revisar_oportunidad(context: ContextTypes.DEFAULT_TYPE):
 # -------------------
 # COMANDOS
 # -------------------
-async def oportunidad(update, context):
-    spot = obtener_precio_actual()
-    frames = obtener_multiframe()
-    señales = analizar_oportunidad(frames)
-    msg = generar_recomendacion(señales, spot)
+async def start(update, context):
+    help_text = (
+        "🤖 Bot de Oro CFD\n\n"
+        "Comandos disponibles:\n"
+        "/price → Precio actual e indicadores\n"
+        "/opportunity → Detectar oportunidad actual\n"
+        "/addid <id> → Añadir chat autorizado\n"
+        "/config → Ver configuración actual\n"
+        "/set <param> <valor> → Ajustar configuración\n"
+        "/help → Mostrar esta ayuda"
+    )
+    await update.message.reply_text(help_text)
+
+
+async def help_cmd(update, context):
+    await start(update, context)
+
+
+async def price(update, context):
+    msg = construir_mensaje()
+    await update.message.reply_text(msg)
+
+
+async def opportunity(update, context):
+    msg = construir_mensaje()
     await update.message.reply_text("📊 Oportunidad actual:\n" + msg)
+
+
+async def addid(update, context):
+    if context.args:
+        new_id = context.args[0]
+        if new_id not in CHAT_IDS:
+            CHAT_IDS.append(new_id)
+            await update.message.reply_text(f"✅ Nuevo chat_id añadido: {new_id}")
+        else:
+            await update.message.reply_text("⚠️ Ese chat_id ya está autorizado.")
+    else:
+        await update.message.reply_text("Uso: /addid <id>")
+
+
+async def show_config(update, context):
+    msg = "⚙️ Configuración actual:\n" + "\n".join(f"{k}: {v}" for k, v in config.items())
+    await update.message.reply_text(msg)
+
+
+async def set_config(update, context):
+    if len(context.args) < 2:
+        await update.message.reply_text("Uso: /set <param> <valor>")
+        return
+    param, valor = context.args[0], context.args[1]
+    if param in config:
+        try:
+            config[param] = float(valor)
+            await update.message.reply_text(f"✅ {param} actualizado a {valor}")
+        except:
+            config[param] = valor
+            await update.message.reply_text(f"✅ {param} actualizado a {valor}")
+    else:
+        await update.message.reply_text("⚠️ Parámetro no válido.")
 
 
 # -------------------
@@ -202,18 +250,25 @@ async def oportunidad(update, context):
 # -------------------
 def main():
     application = Application.builder().token(TOKEN).build()
-    application.add_handler(CommandHandler("opportunity", oportunidad))
 
+    # Handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("price", price))
+    application.add_handler(CommandHandler("opportunity", opportunity))
+    application.add_handler(CommandHandler("addid", addid))
+    application.add_handler(CommandHandler("config", show_config))
+    application.add_handler(CommandHandler("set", set_config))
+
+    # Jobs
     job_queue = application.job_queue
-    job_queue.run_repeating(revisar_mercado, interval=1800, first=5)
-    job_queue.run_repeating(revisar_oportunidad, interval=300, first=30)
+    job_queue.run_repeating(revisar_mercado, interval=1800, first=10)  # cada 30 min
+    job_queue.run_repeating(revisar_oportunidad, interval=300, first=60)  # cada 5 min
 
     application.run_polling()
 
 
-# -------------------
 # FLASK KEEP-ALIVE
-# -------------------
 app = Flask(__name__)
 
 @app.route('/')
